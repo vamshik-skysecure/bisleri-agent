@@ -41,6 +41,7 @@ def tracker_row_to_sp_fields(row: TrackerRow) -> dict:
         FIELD_MAP["pending"]: row.pending,
         FIELD_MAP["current_status"]: row.current_status.value,
         FIELD_MAP["next_action"]: row.next_action,
+        f"{FIELD_MAP['owner']}@odata.type": "Collection(Edm.String)",
         FIELD_MAP["owner"]: [o.value for o in row.owner],
         FIELD_MAP["expected_dispatch_date"]: (
             row.expected_dispatch_date.isoformat() if row.expected_dispatch_date else None

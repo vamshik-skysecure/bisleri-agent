@@ -6,10 +6,23 @@ admin-consented in Azure AD.
 import time
 import requests
 import msal
+from requests import Response
 
 from app.config import settings
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _raise_for_graph_error(resp: Response) -> None:
+    """Raise with Graph's response body so SharePoint schema errors are visible."""
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        body = resp.text[:4000]
+        raise requests.HTTPError(
+            f"{exc}; Graph response body: {body}",
+            response=resp,
+        ) from exc
 
 
 class SharePointClient:
@@ -58,7 +71,7 @@ class SharePointClient:
         items = []
         while url:
             resp = requests.get(url, headers=self._headers(), params=params if "?" not in url else None)
-            resp.raise_for_status()
+            _raise_for_graph_error(resp)
             data = resp.json()
             items.extend(data.get("value", []))
             url = data.get("@odata.nextLink")
@@ -76,25 +89,25 @@ class SharePointClient:
         resp = requests.get(url, headers=self._headers(), params={"expand": "fields"})
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        _raise_for_graph_error(resp)
         return resp.json()
 
     def get_columns(self, list_id: str) -> list[dict]:
         url = f"{GRAPH_BASE}/sites/{settings.SITE_ID}/lists/{list_id}/columns"
         resp = requests.get(url, headers=self._headers(), params={"$select": "displayName,name"})
-        resp.raise_for_status()
+        _raise_for_graph_error(resp)
         return resp.json().get("value", [])
 
     def create_item(self, list_id: str, fields: dict) -> dict:
         url = f"{GRAPH_BASE}/sites/{settings.SITE_ID}/lists/{list_id}/items"
         resp = requests.post(url, headers=self._headers(), json={"fields": fields})
-        resp.raise_for_status()
+        _raise_for_graph_error(resp)
         return resp.json()
 
     def update_item(self, list_id: str, item_id: str, fields: dict) -> dict:
         url = f"{GRAPH_BASE}/sites/{settings.SITE_ID}/lists/{list_id}/items/{item_id}/fields"
         resp = requests.patch(url, headers=self._headers(), json=fields)
-        resp.raise_for_status()
+        _raise_for_graph_error(resp)
         return resp.json()
 
 
