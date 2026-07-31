@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+traffic-policy.yml
+ngrok.exe
+*.log
+.coverage
+htmlcov/
