@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import logging
 import mimetypes
 import time
 from datetime import date, datetime
@@ -14,6 +15,9 @@ from pypdf import PdfReader
 
 from app.config import settings
 from app.models.tracker import EmailAttachment, ExtractionResult, RawEmailRequest, UpdateType
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractionServiceError(RuntimeError):
@@ -75,18 +79,51 @@ EXTRACTION_SCHEMA = {
 
 
 def _decode_attachment(attachment: EmailAttachment) -> bytes:
-    encoded = attachment.content_base64.strip()
+    encoded = "".join(attachment.content_base64.split())
     if encoded.startswith("data:") and "," in encoded:
         encoded = encoded.split(",", 1)[1]
+    padding = len(encoded) % 4
+    if padding:
+        encoded += "=" * (4 - padding)
     try:
-        data = base64.b64decode(encoded, validate=True)
+        data = base64.b64decode(encoded, altchars=b"-_", validate=True)
     except (ValueError, TypeError) as exc:
         raise ExtractionServiceError(f"Attachment '{attachment.name}' is not valid base64") from exc
+    if _looks_like_base64_text(data):
+        try:
+            nested = "".join(data.decode("ascii").split())
+            nested_padding = len(nested) % 4
+            if nested_padding:
+                nested += "=" * (4 - nested_padding)
+            nested_data = base64.b64decode(nested, altchars=b"-_", validate=True)
+        except (UnicodeDecodeError, ValueError, TypeError) as exc:
+            raise ExtractionServiceError(f"Attachment '{attachment.name}' is double-encoded but not valid base64") from exc
+        if _looks_like_attachment_bytes(nested_data):
+            logger.info("Decoded double-encoded attachment: name=%s", attachment.name)
+            data = nested_data
     if len(data) > settings.MAX_ATTACHMENT_BYTES:
         raise ExtractionServiceError(
             f"Attachment '{attachment.name}' exceeds {settings.MAX_ATTACHMENT_BYTES} bytes"
         )
     return data
+
+
+def _looks_like_base64_text(data: bytes) -> bool:
+    if len(data) < 16:
+        return False
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    stripped = "".join(text.split())
+    if not stripped:
+        return False
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-"
+    return all(char in allowed for char in stripped[:200])
+
+
+def _looks_like_attachment_bytes(data: bytes) -> bool:
+    return data.startswith((b"%PDF", b"PK\x03\x04", b"\x89PNG", b"\xff\xd8\xff"))
 
 
 def _content_type(attachment: EmailAttachment) -> str:
@@ -211,11 +248,21 @@ def build_model_content(email: RawEmailRequest) -> list[dict]:
         text_parts.extend(["--- EMAIL HTML/TABLE TEXT ---", _html_to_text(email.body_html)])
 
     for attachment in email.attachments:
-        data = _decode_attachment(attachment)
-        total_bytes += len(data)
-        if total_bytes > settings.MAX_EMAIL_BYTES:
-            raise ExtractionServiceError(f"Total attachment size exceeds {settings.MAX_EMAIL_BYTES} bytes")
-        attachment_text, attachment_images = _attachment_to_content(attachment, data)
+        try:
+            data = _decode_attachment(attachment)
+            total_bytes += len(data)
+            if total_bytes > settings.MAX_EMAIL_BYTES:
+                raise ExtractionServiceError(f"Total attachment size exceeds {settings.MAX_EMAIL_BYTES} bytes")
+            attachment_text, attachment_images = _attachment_to_content(attachment, data)
+        except ExtractionServiceError as exc:
+            logger.warning(
+                "Skipping attachment during extraction: message_id=%s attachment=%s reason=%s",
+                email.message_id,
+                attachment.name,
+                exc,
+            )
+            text_parts.append(f"--- SKIPPED ATTACHMENT: {attachment.name} ---\n{exc}")
+            continue
         text_parts.append(attachment_text)
         images.extend(attachment_images)
 
@@ -223,6 +270,19 @@ def build_model_content(email: RawEmailRequest) -> list[dict]:
     if len(combined) > settings.MAX_EXTRACTED_TEXT_CHARS:
         combined = combined[: settings.MAX_EXTRACTED_TEXT_CHARS] + "\n[content truncated]"
     return [{"type": "text", "text": combined}, *images[:10]]
+
+
+def _without_images(content: list[dict], rejection_detail: str) -> list[dict]:
+    text = "\n\n".join(
+        part.get("text", "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    )
+    note = (
+        "\n\n[Image attachment content was omitted on retry because Azure OpenAI "
+        f"rejected the image payload: {rejection_detail[:300]}]"
+    )
+    return [{"type": "text", "text": text + note}]
 
 
 def _chat_url() -> str:
@@ -233,7 +293,7 @@ def _chat_url() -> str:
     return f"{endpoint}/openai/deployments/{deployment}/chat/completions"
 
 
-def _call_azure_openai(content: list[dict]) -> dict:
+def _post_azure_openai(content: list[dict]) -> requests.Response:
     payload = {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -276,6 +336,10 @@ def _call_azure_openai(content: list[dict]) -> dict:
 
     if response is None:
         raise ExtractionServiceError("Azure OpenAI returned no response")
+    return response
+
+
+def _parse_azure_response(response: requests.Response) -> dict:
     if not response.ok:
         detail = response.text[:500]
         raise ExtractionServiceError(f"Azure OpenAI returned HTTP {response.status_code}: {detail}")
@@ -290,6 +354,24 @@ def _call_azure_openai(content: list[dict]) -> dict:
         return json.loads(raw_content)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise ExtractionServiceError("Azure OpenAI returned an invalid structured response") from exc
+
+
+def _call_azure_openai(content: list[dict]) -> dict:
+    response = _post_azure_openai(content)
+    if response.ok:
+        return _parse_azure_response(response)
+
+    detail = response.text[:500]
+    has_images = any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for part in content
+    )
+    if has_images and response.status_code in {400, 415, 422}:
+        logger.warning("Azure OpenAI rejected image payload; retrying text-only. detail=%s", detail)
+        retry_response = _post_azure_openai(_without_images(content, detail))
+        return _parse_azure_response(retry_response)
+
+    raise ExtractionServiceError(f"Azure OpenAI returned HTTP {response.status_code}: {detail}")
 
 
 def extract_email(email: RawEmailRequest) -> list[ExtractionResult]:

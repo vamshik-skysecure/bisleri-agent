@@ -18,7 +18,7 @@ from app.models.tracker import (
     TrackerRow,
     UpdateType,
 )
-from app.services.extraction_service import build_model_content, extract_email
+from app.services.extraction_service import build_model_content, extract_email, _decode_attachment
 from app.services.field_mapping import sp_item_to_tracker_row
 from app.services.history_service import status_age_days_by_po
 from app.services.sharepoint_client import sharepoint_client
@@ -196,6 +196,7 @@ class RawExtractionTests(unittest.TestCase):
         supported = [
             path for path in test_data.iterdir()
             if path.suffix.casefold() in {".pdf", ".xlsx", ".xlsm", ".png", ".jpg", ".jpeg"}
+            and not path.name.startswith("~$")
         ]
         self.assertTrue(supported)
         for path in supported:
@@ -262,6 +263,17 @@ class RawExtractionTests(unittest.TestCase):
         self.assertEqual(records[0].source_email_id, "raw-mail-2")
         self.assertEqual(records[0].update_type, UpdateType.DISPATCH)
         self.assertEqual(records[0].expected_delivery_date, date(2026, 8, 2))
+
+    def test_double_encoded_pdf_attachment_is_decoded(self):
+        pdf_bytes = b"%PDF-1.4\n%%EOF\n"
+        once = base64.b64encode(pdf_bytes)
+        twice = base64.b64encode(once).decode("ascii")
+        attachment = EmailAttachment(
+            name="double.pdf",
+            content_type="application/pdf",
+            content_base64=twice,
+        )
+        self.assertEqual(_decode_attachment(attachment), pdf_bytes)
 
 
 if __name__ == "__main__":
